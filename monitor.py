@@ -54,7 +54,7 @@ def iso(ts: dt.datetime) -> str:
 
 def iso_utc8(ts: dt.datetime) -> str:
     tz8 = dt.timezone(dt.timedelta(hours=8))
-    return ts.astimezone(tz8).replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S%z")
+    return ts.astimezone(tz8).replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def parse_iso(v: str) -> dt.datetime:
@@ -373,8 +373,7 @@ def notify_feishu(
         f"**状态变更时间(UTC+8)：**{iso_utc8(parse_iso(changed_at))}"
     )
     # Keep diagnostic detail only for abnormal states to reduce noise.
-    if new_status in {"Rejected", "MonitorFailed", "ActionRequired", "TimeoutMonitoring", "TimeoutClosed"}:
-        content += f"\n**说明：**{detail}"
+    # Hidden from card by default to keep notification concise.
 
     actions = []
     if detail_url:
@@ -382,7 +381,7 @@ def notify_feishu(
             {
                 "tag": "button",
                 "type": "primary",
-                "text": {"tag": "plain_text", "content": "查看插件详情页"},
+                "text": {"tag": "plain_text", "content": "View Extension Detail"},
                 "url": detail_url,
             }
         )
@@ -394,12 +393,19 @@ def notify_feishu(
             "config": {"wide_screen_mode": True},
             "header": {
                 "template": header_template,
-                "title": {"tag": "plain_text", "content": "插件审核动态推送"},
+                "title": {"tag": "plain_text", "content": "Extension Audit Status"},
             },
             "elements": [
                 {
                     "tag": "markdown",
-                    "content": content,
+                    "content": (
+                        f"Name：{plugin_name}\n"
+                        f"ID：{task.item_id}\n"
+                        f"Store：{task.store}\n"
+                        f"Version：{effective_version}\n"
+                        f"Status Update：{old_status} -> {new_status}\n"
+                        f"Date(UTC+8)：{iso_utc8(parse_iso(changed_at))}"
+                    ),
                 },
                 {"tag": "action", "actions": actions} if actions else {"tag": "hr"},
             ],
