@@ -8,6 +8,8 @@ data/*.db
 data/*.sqlite
 data/*.sqlite3
 data/*_batch.csv
+logs/
+*.log
 
 # Local secrets
 .env

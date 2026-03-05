@@ -19,6 +19,7 @@ A lightweight monitor for browser extension review status with Feishu card notif
 - `.env.example`: Environment variable template
 - `requirements.txt`: Python dependencies
 - `data/`: Local runtime database and optional local CSV files
+- `docs/plugin-review-dynamic-push-prd.md`: Requirement sync for Chrome/Edge review push policy
 
 ## Setup
 

@@ -2,6 +2,7 @@
 import csv
 import datetime as dt
 import email
+import email.utils
 import imaplib
 import json
 import os
@@ -390,16 +391,21 @@ def notify_feishu(
     elif new_status in {"Approved", "PublishedPublic"}:
         header_template = "green"
 
-    content = (
-        f"**插件名：**{plugin_name}\n"
-        f"**插件ID：**{task.item_id}\n"
-        f"**商店：**{task.store}\n"
-        f"**版本：**{effective_version}\n"
-        f"**状态变更：**{old_status} -> {new_status}\n"
-        f"**状态变更时间(UTC+8)：**{iso_utc8(parse_iso(changed_at))}"
-    )
-    # Keep diagnostic detail only for abnormal states to reduce noise.
-    # Hidden from card by default to keep notification concise.
+    def edge_status_text(status: str) -> str:
+        return {
+            "Approved": "✅ 审核通过",
+            "Rejected": "❌ 审核拒绝",
+            "ActionRequired": "⚠️ 需要处理",
+        }.get(status, "⏳ 审核中")
+
+    def edge_title_text(status: str, name: str) -> str:
+        if status == "Approved":
+            return f"Your product, {name}, has been successfully published"
+        if status == "Rejected":
+            return f"Your product, {name}, was rejected"
+        if status == "ActionRequired":
+            return f"Your product, {name}, needs action"
+        return f"Your product, {name}, is in review"
 
     actions = []
     if detail_url:
@@ -412,26 +418,43 @@ def notify_feishu(
             }
         )
 
-    # Feishu interactive card markdown supports bold labels.
+    if task.store == "edge":
+        card_title = "Edge Extension Audit Monitor"
+        body = (
+            f"[Title]: {edge_title_text(new_status, plugin_name)}\n"
+            f"[ID]: {task.item_id}\n"
+            f"[Version]: {effective_version}\n"
+            f"[Date(UTC+8)]: {iso_utc8(parse_iso(changed_at))}"
+        )
+    else:
+        card_title = "Chrome Extension Audit Monitor"
+        body = (
+            "[Name]: {name}\n"
+            "[ID]: {item}\n"
+            "[Version]: {version}\n"
+            "[Status Update]: {old_s} -> {new_s}\n"
+            "[Date(UTC+8)]: {changed}"
+        ).format(
+            name=plugin_name,
+            item=task.item_id,
+            version=effective_version,
+            old_s=old_status,
+            new_s=new_status,
+            changed=iso_utc8(parse_iso(changed_at)),
+        )
+
     payload = {
         "msg_type": "interactive",
         "card": {
             "config": {"wide_screen_mode": True},
             "header": {
                 "template": header_template,
-                "title": {"tag": "plain_text", "content": "Extension Audit Status"},
+                "title": {"tag": "plain_text", "content": card_title},
             },
             "elements": [
                 {
                     "tag": "markdown",
-                    "content": (
-                        f"Name：{plugin_name}\n"
-                        f"ID：{task.item_id}\n"
-                        f"Store：{task.store}\n"
-                        f"Version：{effective_version}\n"
-                        f"Status Update：{old_status} -> {new_status}\n"
-                        f"Date(UTC+8)：{iso_utc8(parse_iso(changed_at))}"
-                    ),
+                    "content": body,
                 },
                 {"tag": "action", "actions": actions} if actions else {"tag": "hr"},
             ],
@@ -574,6 +597,15 @@ def decode_mail_part(msg: email.message.Message) -> str:
     return ""
 
 
+def edge_id_candidates(task: Task) -> list[str]:
+    candidates = {(task.item_id or "").strip().lower()}
+    detail_url = (task.detail_url or "").strip().lower()
+    m = re.search(r"/detail/([a-z0-9]{32})", detail_url)
+    if m:
+        candidates.add(m.group(1))
+    return [c for c in candidates if c]
+
+
 def fetch_edge_status_from_email(task: Task) -> Tuple[str, str]:
     host = os.getenv("EDGE_IMAP_HOST", "").strip()
     user = os.getenv("EDGE_IMAP_USER", "").strip()
@@ -589,6 +621,8 @@ def fetch_edge_status_from_email(task: Task) -> Tuple[str, str]:
     action_keywords = [k.strip().lower() for k in os.getenv("EDGE_MAIL_ACTION_KEYWORDS", "action required").split(",") if k.strip()]
 
     try:
+        submitted = parse_iso(task.submitted_at)
+        id_candidates = edge_id_candidates(task)
         mail = imaplib.IMAP4_SSL(host, port)
         mail.login(user, pwd)
         mail.select(folder)
@@ -608,11 +642,24 @@ def fetch_edge_status_from_email(task: Task) -> Tuple[str, str]:
             if from_keywords and not any(k in mail_from for k in from_keywords):
                 continue
 
+            msg_date = str(msg.get("Date", "")).strip()
+            if msg_date:
+                try:
+                    msg_ts = email.utils.parsedate_to_datetime(msg_date)
+                    if msg_ts is not None:
+                        if msg_ts.tzinfo is None:
+                            msg_ts = msg_ts.replace(tzinfo=dt.timezone.utc)
+                        msg_ts = msg_ts.astimezone(dt.timezone.utc)
+                        if msg_ts < submitted:
+                            continue
+                except Exception:
+                    pass
+
             subject = str(msg.get("Subject", ""))
             body = decode_mail_part(msg)
             text = f"{subject}\n{body}".lower()
 
-            if task.item_id.lower() not in text and task.version.lower() not in text:
+            if not any(c in text for c in id_candidates):
                 continue
 
             if any(k in text for k in rejected_keywords):
