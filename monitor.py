@@ -95,6 +95,10 @@ def resolve_path(path_value: str) -> str:
 
 
 def db_connect(db_path: str) -> sqlite3.Connection:
+    if db_path == ":memory:":
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        return conn
     resolved = resolve_path(db_path)
     parent = os.path.dirname(resolved)
     if parent:
@@ -209,9 +213,31 @@ def list_plugins(conn: sqlite3.Connection) -> None:
         )
 
 
+def find_active_task_by_version(conn: sqlite3.Connection, store: str, item_id: str, version: str) -> Optional[sqlite3.Row]:
+    rows = conn.execute(
+        """
+        SELECT id, status, version
+        FROM tasks
+        WHERE store = ? AND item_id = ? AND status NOT IN ('Approved', 'Rejected', 'ActionRequired', 'Cancelled', 'TimeoutClosed')
+        ORDER BY id DESC
+        """,
+        (store, item_id),
+    ).fetchall()
+    target = canonical_version(version)
+    for r in rows:
+        if canonical_version(r["version"]) == target:
+            return r
+    return None
+
+
 def add_task(conn: sqlite3.Connection, store: str, plugin_name: Optional[str], detail_url: Optional[str], item_id: str, version: str, submitted_at: str,
              owner: Optional[str], operation_id: Optional[str], check_frequency_seconds: int,
-             timeout_hours: int) -> int:
+             timeout_hours: int, allow_duplicate: bool = False) -> Tuple[int, bool]:
+    if not allow_duplicate:
+        existing = find_active_task_by_version(conn, store, item_id, version)
+        if existing:
+            return int(existing["id"]), False
+
     ts = now_utc()
     reg = get_registered_plugin(conn, store, item_id)
     final_plugin_name = (plugin_name or "").strip() or (reg["plugin_name"] if reg else None) or default_plugin_name(item_id)
@@ -231,7 +257,7 @@ def add_task(conn: sqlite3.Connection, store: str, plugin_name: Optional[str], d
         ),
     )
     conn.commit()
-    return int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+    return int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]), True
 
 
 def list_tasks(conn: sqlite3.Connection) -> None:
@@ -722,6 +748,7 @@ def main() -> None:
     add.add_argument("--submitted-at", default=iso(now_utc()))
     add.add_argument("--owner", default="")
     add.add_argument("--operation-id", default="")
+    add.add_argument("--allow-duplicate", action="store_true", help="create task even when active task with same version exists")
 
     reg = sub.add_parser("register-plugin")
     reg.add_argument("--store", required=True, choices=["chrome", "edge"])
@@ -734,6 +761,7 @@ def main() -> None:
     batch.add_argument("--default-store", default="chrome", choices=["chrome", "edge"])
     batch.add_argument("--default-version", default="")
     batch.add_argument("--default-submitted-at", default=iso(now_utc()))
+    batch.add_argument("--allow-duplicate", action="store_true", help="create duplicate tasks for same active version")
 
     run = sub.add_parser("run")
     run.add_argument("--once", action="store_true")
@@ -750,7 +778,7 @@ def main() -> None:
 
     init_db(conn)
     if args.cmd == "add-task":
-        task_id = add_task(
+        task_id, created = add_task(
             conn,
             store=args.store,
             plugin_name=args.plugin_name or None,
@@ -762,8 +790,12 @@ def main() -> None:
             operation_id=args.operation_id or None,
             check_frequency_seconds=env_int("DEFAULT_POLL_SECONDS", 300),
             timeout_hours=env_int("TIMEOUT_HOURS", 72),
+            allow_duplicate=args.allow_duplicate,
         )
-        print(f"task created: id={task_id}")
+        if created:
+            print(f"task created: id={task_id}")
+        else:
+            print(f"task already exists (active same version): id={task_id}")
         return
 
     if args.cmd == "register-plugin":
@@ -784,6 +816,7 @@ def main() -> None:
     if args.cmd == "add-batch":
         file_path = resolve_path(args.file)
         created_ids = []
+        reused_ids = []
         with open(file_path, "r", encoding="utf-8-sig", newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
@@ -794,7 +827,7 @@ def main() -> None:
                 version = (row.get("version") or args.default_version).strip()
                 if not version:
                     continue
-                task_id = add_task(
+                task_id, created = add_task(
                     conn,
                     store=store,
                     plugin_name=(row.get("plugin_name") or "").strip() or None,
@@ -806,9 +839,13 @@ def main() -> None:
                     operation_id=(row.get("operation_id") or "").strip() or None,
                     check_frequency_seconds=env_int("DEFAULT_POLL_SECONDS", 300),
                     timeout_hours=env_int("TIMEOUT_HOURS", 72),
+                    allow_duplicate=args.allow_duplicate,
                 )
-                created_ids.append(task_id)
-        print(f"batch created tasks: {len(created_ids)} ids={created_ids}")
+                if created:
+                    created_ids.append(task_id)
+                else:
+                    reused_ids.append(task_id)
+        print(f"batch result: created={len(created_ids)} reused={len(reused_ids)} created_ids={created_ids} reused_ids={reused_ids}")
         return
 
     if args.cmd == "list-tasks":

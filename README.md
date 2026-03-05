@@ -63,6 +63,13 @@ Create a monitoring task:
 python monitor.py add-task --store chrome --item-id <extension_id> --version <version>
 ```
 
+Default behavior prevents duplicate active tasks for the same `store + item_id + version`.
+Use `--allow-duplicate` to force creation:
+
+```powershell
+python monitor.py add-task --store chrome --item-id <extension_id> --version <version> --allow-duplicate
+```
+
 Create a monitoring task with explicit metadata:
 
 ```powershell
@@ -74,6 +81,8 @@ Batch create tasks from CSV:
 ```powershell
 python monitor.py add-batch --file .\data\plugins_batch.csv
 ```
+
+Batch mode follows the same dedup rule by default. Add `--allow-duplicate` if needed.
 
 CSV columns:
 
