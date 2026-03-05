@@ -1,0 +1,17 @@
+﻿# Python cache and virtualenv
+__pycache__/
+*.pyc
+.venv/
+
+# Local runtime data
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+data/*_batch.csv
+
+# Local secrets
+.env
+
+# OS/editor
+.DS_Store
+Thumbs.db
