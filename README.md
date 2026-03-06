@@ -33,7 +33,8 @@ Copy-Item .env.example .env
 
 Fill `.env` with your own values:
 
-- `FEISHU_WEBHOOK_URL`
+- Feishu App Bot (`FEISHU_APP_ID`, `FEISHU_APP_SECRET`, and `FEISHU_CHAT_ID` or cached chat id from command bot)
+- Optional legacy fallback: `FEISHU_WEBHOOK_URL`
 - Chrome OAuth (`CHROME_PUBLISHER_ID`, `CHROME_CLIENT_ID`, `CHROME_CLIENT_SECRET`, `CHROME_REFRESH_TOKEN`) or `CHROME_ACCESS_TOKEN`
 - Optional Edge API (`EDGE_CLIENT_ID`, `EDGE_API_KEY`)
 - Optional Edge IMAP email fallback (`EDGE_IMAP_*`)
@@ -51,6 +52,9 @@ Register a plugin (recommended for multi-plugin setup):
 ```powershell
 python monitor.py register-plugin --store chrome --item-id <extension_id> --plugin-name "<plugin_name>" --detail-url "<store_detail_url>"
 ```
+
+For `edge` plugins, once registered, the runner will automatically keep one active monitoring task per enabled plugin.
+This means you do not need to manually create a new task for every submission cycle.
 
 List registered plugins:
 
@@ -101,6 +105,12 @@ Run continuously:
 python monitor.py run
 ```
 
+Run Feishu status command bot (for `@bot status` style query):
+
+```powershell
+python feishu_status_bot.py
+```
+
 List tasks:
 
 ```powershell
@@ -122,6 +132,25 @@ python monitor.py list-tasks
 - Never commit real secrets to `.env.example`
 - Keep actual credentials in local `.env`
 - Rotate webhook and OAuth credentials immediately if exposed
+
+## Feishu Command Bot Setup
+
+To support querying status in group chat by mentioning the bot and sending `status`:
+
+1. Create/prepare a Feishu app bot with event subscription enabled.
+2. Configure event callback URL to your server endpoint running `feishu_status_bot.py`.
+3. Subscribe to message receive events (text messages in group).
+4. Fill these env vars in `.env`:
+   - `FEISHU_APP_ID`
+   - `FEISHU_APP_SECRET`
+   - `FEISHU_CHAT_ID` (optional if you trigger `status` at least once; bot will cache chat id automatically)
+   - `FEISHU_STATUS_PORT` (default `8088`)
+   - `FEISHU_STATUS_COMMAND` (default `status`)
+   - `FEISHU_STATUS_PLUGIN_TARGETS` (4 plugin ids to return)
+5. Start bot service:
+   - `python feishu_status_bot.py`
+
+After first successful `@bot status`, active monitoring push will use the same App Bot identity.
 
 ## Recommended GitHub Repository Name
 

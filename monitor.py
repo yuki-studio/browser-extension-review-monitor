@@ -95,6 +95,67 @@ def resolve_path(path_value: str) -> str:
     return os.path.normpath(os.path.join(base_dir, path_value))
 
 
+def read_cached_feishu_chat_id() -> str:
+    p = resolve_path("./data/feishu_chat_id.txt")
+    if not os.path.exists(p):
+        return ""
+    try:
+        return (open(p, "r", encoding="utf-8").read() or "").strip()
+    except Exception:
+        return ""
+
+
+def get_feishu_chat_id() -> str:
+    return os.getenv("FEISHU_CHAT_ID", "").strip() or read_cached_feishu_chat_id()
+
+
+def get_feishu_tenant_access_token() -> str:
+    app_id = os.getenv("FEISHU_APP_ID", "").strip()
+    app_secret = os.getenv("FEISHU_APP_SECRET", "").strip()
+    if not app_id or not app_secret:
+        raise RuntimeError("missing FEISHU_APP_ID or FEISHU_APP_SECRET")
+    resp = requests.post(
+        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+        json={"app_id": app_id, "app_secret": app_secret},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"tenant_access_token failed: {data}")
+    token = data.get("tenant_access_token", "")
+    if not token:
+        raise RuntimeError("tenant_access_token missing in response")
+    return token
+
+
+def send_feishu_interactive_by_app(card_payload: dict) -> Tuple[bool, str]:
+    chat_id = get_feishu_chat_id()
+    if not chat_id:
+        return False, "missing FEISHU_CHAT_ID and no cached chat id"
+    try:
+        token = get_feishu_tenant_access_token()
+        url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
+        payload = {
+            "receive_id": chat_id,
+            "msg_type": "interactive",
+            "content": json.dumps({"card": card_payload}, ensure_ascii=False),
+        }
+        resp = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") == 0:
+            return True, "ok"
+        return False, f"send failed: {data}"
+    except Exception as e:
+        return False, str(e)
+
+
 def db_connect(db_path: str) -> sqlite3.Connection:
     if db_path == ":memory:":
         conn = sqlite3.connect(":memory:")
@@ -211,6 +272,57 @@ def list_plugins(conn: sqlite3.Connection) -> None:
         print(
             f"store={r['store']} item={r['item_id']} name={r['plugin_name']} "
             f"enabled={r['enabled']} detail_url={r['detail_url'] or ''}"
+        )
+
+
+def ensure_edge_watch_tasks(conn: sqlite3.Connection) -> None:
+    """Keep one active monitoring task per enabled Edge plugin.
+
+    This allows continuous email-based monitoring without manual task creation
+    for each new submission cycle.
+    """
+    plugins = conn.execute(
+        """
+        SELECT store, item_id, plugin_name, detail_url
+        FROM plugins
+        WHERE store = 'edge' AND enabled = 1
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    now = iso(now_utc())
+    for p in plugins:
+        active = conn.execute(
+            """
+            SELECT id
+            FROM tasks
+            WHERE store = 'edge' AND item_id = ?
+              AND status NOT IN ('Approved', 'Rejected', 'ActionRequired', 'Cancelled', 'TimeoutClosed')
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (p["item_id"],),
+        ).fetchone()
+        if active:
+            continue
+
+        latest = conn.execute(
+            "SELECT version FROM tasks WHERE store = 'edge' AND item_id = ? ORDER BY id DESC LIMIT 1",
+            (p["item_id"],),
+        ).fetchone()
+        version = (latest["version"] if latest else "").strip() or "unknown"
+        add_task(
+            conn,
+            store="edge",
+            plugin_name=p["plugin_name"],
+            detail_url=p["detail_url"],
+            item_id=p["item_id"],
+            version=version,
+            submitted_at=now,
+            owner=None,
+            operation_id=None,
+            check_frequency_seconds=env_int("DEFAULT_POLL_SECONDS", 300),
+            timeout_hours=env_int("TIMEOUT_HOURS", 72),
+            allow_duplicate=False,
         )
 
 
@@ -346,18 +458,21 @@ def update_task_version(conn: sqlite3.Connection, task_id: int, version: str) ->
     conn.commit()
 
 
-def build_notify_key(task: Task, status: str, effective_version: str) -> str:
-    return f"{task.store}|{task.item_id}|{status}|{canonical_version(effective_version)}"
+def build_notify_key(task: Task, old_status: str, status: str, effective_version: str) -> str:
+    status_key = status
+    if task.store == "chrome" and status == "PublishedPublic" and old_status == "PendingReview":
+        status_key = "PublishedPublicFromPendingReview"
+    return f"{task.store}|{task.item_id}|{status_key}|{canonical_version(effective_version)}"
 
 
-def should_notify(conn: sqlite3.Connection, task: Task, status: str, effective_version: str) -> bool:
-    key = build_notify_key(task, status, effective_version)
+def should_notify(conn: sqlite3.Connection, task: Task, old_status: str, status: str, effective_version: str) -> bool:
+    key = build_notify_key(task, old_status, status, effective_version)
     row = conn.execute("SELECT 1 FROM notification_keys WHERE k = ?", (key,)).fetchone()
     return row is None
 
 
-def record_notify(conn: sqlite3.Connection, task: Task, status: str, effective_version: str, channel: str) -> None:
-    key = build_notify_key(task, status, effective_version)
+def record_notify(conn: sqlite3.Connection, task: Task, old_status: str, status: str, effective_version: str, channel: str) -> None:
+    key = build_notify_key(task, old_status, status, effective_version)
     ts = iso(now_utc())
     conn.execute(
         "INSERT OR IGNORE INTO notifications(task_id, status, sent_at, channel) VALUES (?, ?, ?, ?)",
@@ -379,8 +494,6 @@ def notify_feishu(
     effective_version: str,
     changed_at: str,
 ) -> Tuple[bool, str]:
-    if not webhook_url:
-        return False, "FEISHU_WEBHOOK_URL not set"
     plugin_name = (task.plugin_name or "").strip() or default_plugin_name(task.item_id) or "未命名插件"
     detail_url = (task.detail_url or "").strip() or default_plugin_detail_url(task.item_id) or ""
     header_template = "blue"
@@ -420,14 +533,16 @@ def notify_feishu(
 
     if task.store == "edge":
         card_title = "Edge Extension Audit Monitor"
+        display_version = effective_version
         body = (
             f"[Title]: {edge_title_text(new_status, plugin_name)}\n"
             f"[ID]: {task.item_id}\n"
-            f"[Version]: {effective_version}\n"
+            f"[Version]: {display_version}\n"
             f"[Date(UTC+8)]: {iso_utc8(parse_iso(changed_at))}"
         )
     else:
         card_title = "Chrome Extension Audit Monitor"
+        display_version = canonical_version(effective_version)
         body = (
             "[Name]: {name}\n"
             "[ID]: {item}\n"
@@ -437,36 +552,59 @@ def notify_feishu(
         ).format(
             name=plugin_name,
             item=task.item_id,
-            version=effective_version,
+            version=display_version,
             old_s=old_status,
             new_s=new_status,
             changed=iso_utc8(parse_iso(changed_at)),
         )
 
-    payload = {
-        "msg_type": "interactive",
-        "card": {
-            "config": {"wide_screen_mode": True},
-            "header": {
-                "template": header_template,
-                "title": {"tag": "plain_text", "content": card_title},
-            },
-            "elements": [
-                {
-                    "tag": "markdown",
-                    "content": body,
-                },
-                {"tag": "action", "actions": actions} if actions else {"tag": "hr"},
-            ],
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": header_template,
+            "title": {"tag": "plain_text", "content": card_title},
         },
+        "elements": [
+            {
+                "tag": "markdown",
+                "content": body,
+            },
+            {"tag": "action", "actions": actions} if actions else {"tag": "hr"},
+        ],
     }
-    try:
-        resp = requests.post(webhook_url, json=payload, timeout=10)
-        if resp.status_code == 200:
-            return True, "ok"
-        return False, f"http {resp.status_code}: {resp.text[:200]}"
-    except Exception as e:
-        return False, str(e)
+
+    def send_webhook() -> Tuple[bool, str]:
+        if not webhook_url:
+            return False, "FEISHU_WEBHOOK_URL not set"
+        payload = {"msg_type": "interactive", "card": card}
+        try:
+            resp = requests.post(webhook_url, json=payload, timeout=10)
+            if resp.status_code != 200:
+                return False, f"http {resp.status_code}: {resp.text[:200]}"
+            try:
+                body = resp.json()
+            except Exception:
+                return False, f"webhook non-json response: {resp.text[:200]}"
+            if body.get("code") == 0:
+                return True, "ok(webhook)"
+            return False, f"webhook rejected: code={body.get('code')} msg={body.get('msg')}"
+        except Exception as e:
+            return False, str(e)
+
+    mode = os.getenv("FEISHU_DELIVERY_MODE", "app_then_webhook").strip().lower()
+    if mode == "webhook":
+        return send_webhook()
+    if mode == "app":
+        return send_feishu_interactive_by_app(card)
+
+    # Default: app first, then webhook fallback.
+    ok, note = send_feishu_interactive_by_app(card)
+    if ok:
+        return ok, note
+    wk_ok, wk_note = send_webhook()
+    if wk_ok:
+        return wk_ok, wk_note
+    return False, f"app_bot_failed={note}; webhook_failed={wk_note}"
 
 
 def get_chrome_access_token() -> Optional[str]:
@@ -474,18 +612,22 @@ def get_chrome_access_token() -> Optional[str]:
     client_secret = os.getenv("CHROME_CLIENT_SECRET", "").strip()
     refresh_token = os.getenv("CHROME_REFRESH_TOKEN", "").strip()
     if client_id and client_secret and refresh_token:
-        data = {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "refresh_token": refresh_token,
-            "grant_type": "refresh_token",
-        }
-        resp = requests.post("https://oauth2.googleapis.com/token", data=data, timeout=15)
-        resp.raise_for_status()
-        body = resp.json()
-        token = body.get("access_token")
-        if token:
-            return token
+        try:
+            data = {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            }
+            resp = requests.post("https://oauth2.googleapis.com/token", data=data, timeout=15)
+            resp.raise_for_status()
+            body = resp.json()
+            token = body.get("access_token")
+            if token:
+                return token
+        except Exception:
+            # Degrade gracefully to static token fallback instead of crashing run loop.
+            pass
 
     token = os.getenv("CHROME_ACCESS_TOKEN", "").strip()
     if token:
@@ -704,7 +846,7 @@ def handle_task(conn: sqlite3.Connection, task: Task, webhook_url: str,
             if old_status != new_status:
                 ok, note = notify_feishu(webhook_url, task, notify_old_status, new_status, detail, effective_version, changed_at)
                 if ok:
-                    record_notify(conn, task, new_status, effective_version, "feishu")
+                    record_notify(conn, task, notify_old_status, new_status, effective_version, "feishu")
             return
 
     if not task.timeout_started_at and now >= submitted + dt.timedelta(hours=task.timeout_hours):
@@ -715,7 +857,7 @@ def handle_task(conn: sqlite3.Connection, task: Task, webhook_url: str,
         if old_status != new_status:
             ok, note = notify_feishu(webhook_url, task, notify_old_status, new_status, detail, effective_version, changed_at)
             if ok:
-                record_notify(conn, task, new_status, effective_version, "feishu")
+                record_notify(conn, task, notify_old_status, new_status, effective_version, "feishu")
         return
 
     new_status, detail, source, observed_version = fetch_task_status(task)
@@ -746,10 +888,10 @@ def handle_task(conn: sqlite3.Connection, task: Task, webhook_url: str,
         next_check = iso(now + dt.timedelta(seconds=task.check_frequency_seconds))
         changed_at = update_task_status(conn, task.id, new_status, source, detail, next_check)
 
-    if new_status != old_status and should_notify(conn, task, new_status, effective_version):
+    if new_status != old_status and should_notify(conn, task, notify_old_status, new_status, effective_version):
         ok, note = notify_feishu(webhook_url, task, notify_old_status, new_status, detail, effective_version, changed_at)
         if ok:
-            record_notify(conn, task, new_status, effective_version, "feishu")
+            record_notify(conn, task, notify_old_status, new_status, effective_version, "feishu")
 
 
 def run_loop(conn: sqlite3.Connection, once: bool = False) -> None:
@@ -759,6 +901,7 @@ def run_loop(conn: sqlite3.Connection, once: bool = False) -> None:
     timeout_followup_days = env_int("TIMEOUT_FOLLOWUP_DAYS", 7)
 
     while True:
+        ensure_edge_watch_tasks(conn)
         tasks = due_tasks(conn)
         for t in tasks:
             handle_task(conn, t, webhook_url, timeout_poll_seconds, timeout_followup_days)

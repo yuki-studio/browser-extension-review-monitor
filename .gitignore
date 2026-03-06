@@ -8,6 +8,7 @@ data/*.db
 data/*.sqlite
 data/*.sqlite3
 data/*_batch.csv
+data/current_tunnel_url.txt
 logs/
 *.log
 
