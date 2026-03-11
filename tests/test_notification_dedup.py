@@ -320,6 +320,44 @@ class EdgeApiPublishTests(unittest.TestCase):
         self.assertEqual(row["product_id"], "12345678-1234-1234-1234-1234567890ab")
         conn.close()
 
+    def test_ensure_edge_watch_tasks_does_not_recreate_after_terminal_status(self) -> None:
+        conn = monitor.db_connect(":memory:")
+        monitor.init_db(conn)
+        monitor.upsert_plugin(
+            conn,
+            store="edge",
+            item_id="bgfbcbkjjndjeamckkakgkiphdhlmbip",
+            product_id="866bad86-33d0-4a50-8a90-ec419502d110",
+            plugin_name="StreamFab Video Downloader for Browser",
+            detail_url=None,
+        )
+        task_id, created = monitor.add_task(
+            conn,
+            store="edge",
+            plugin_name="StreamFab Video Downloader for Browser",
+            detail_url=None,
+            item_id="bgfbcbkjjndjeamckkakgkiphdhlmbip",
+            version="1009",
+            submitted_at=monitor.iso(monitor.now_utc()),
+            owner=None,
+            operation_id=None,
+            check_frequency_seconds=300,
+            timeout_hours=72,
+            product_id="866bad86-33d0-4a50-8a90-ec419502d110",
+        )
+        self.assertTrue(created)
+        conn.execute("UPDATE tasks SET status = 'Approved', next_check_at = NULL WHERE id = ?", (task_id,))
+        conn.commit()
+
+        monitor.ensure_edge_watch_tasks(conn)
+
+        count = conn.execute(
+            "SELECT COUNT(*) AS c FROM tasks WHERE store = 'edge' AND item_id = ?",
+            ("bgfbcbkjjndjeamckkakgkiphdhlmbip",),
+        ).fetchone()["c"]
+        self.assertEqual(count, 1)
+        conn.close()
+
 
 class EdgeNotificationPolicyTests(unittest.TestCase):
     def test_edge_timeout_monitoring_does_not_send_status_push(self) -> None:

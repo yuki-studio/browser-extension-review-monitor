@@ -302,10 +302,11 @@ def list_plugins(conn: sqlite3.Connection) -> None:
 
 
 def ensure_edge_watch_tasks(conn: sqlite3.Connection) -> None:
-    """Keep one active monitoring task per enabled Edge plugin.
+    """Ensure registered Edge plugins have an initial monitoring task.
 
-    This allows continuous email-based monitoring without manual task creation
-    for each new submission cycle.
+    Do not recreate a new task automatically after a terminal result for the
+    same plugin/version. Reopening a finished task caused false "no matching
+    email" alerts after an approval had already been detected.
     """
     plugins = conn.execute(
         """
@@ -329,6 +330,19 @@ def ensure_edge_watch_tasks(conn: sqlite3.Connection) -> None:
             (p["item_id"],),
         ).fetchone()
         if active:
+            continue
+
+        history = conn.execute(
+            """
+            SELECT id
+            FROM tasks
+            WHERE store = 'edge' AND item_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (p["item_id"],),
+        ).fetchone()
+        if history:
             continue
 
         latest = conn.execute(
@@ -681,6 +695,12 @@ def notify_feishu(
             return f"Your product, {name}, was rejected"
         if status == "ActionRequired":
             return f"Your product, {name}, needs action"
+        if status == "MonitorFailed":
+            return f"Monitoring failed for {name}"
+        if status == "TimeoutMonitoring":
+            return f"Review is taking longer than expected for {name}"
+        if status == "TimeoutClosed":
+            return f"Timed follow-up monitoring ended for {name}"
         return f"Your product, {name}, is in review"
 
     actions = []
