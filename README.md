@@ -31,6 +31,7 @@ The main goal is to reduce passive waiting. In particular, Edge reviews are no l
 - `feishu_status_bot.py`: Feishu group status bot
 - `.env.example`: environment template
 - `data/`: local SQLite database and runtime data
+- `docs/monitoring-logic-sop.md`: detailed Chrome and Edge monitoring logic SOP
 - `docs/plugin-review-dynamic-push-prd.md`: notification policy notes
 - `tests/`: unit tests
 
