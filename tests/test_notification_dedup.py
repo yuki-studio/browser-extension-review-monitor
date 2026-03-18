@@ -117,6 +117,32 @@ class NotificationDedupTests(unittest.TestCase):
             )
         )
 
+    def test_chrome_pending_review_message_uses_version_aware_text(self) -> None:
+        sent = {}
+        original_sender = monitor.deliver_feishu_card
+        try:
+            def fake_sender(_webhook_url, card):
+                sent["card"] = card
+                return True, "ok"
+
+            monitor.deliver_feishu_card = fake_sender
+            ok, _ = monitor.notify_feishu(
+                webhook_url="",
+                task=self.task,
+                old_status="PublishedPublic",
+                new_status="PendingReview",
+                detail="chrome api chrome submitted state=PENDING_REVIEW; submitted_version=1.0.0.4; published state=PUBLISHED; published_version=1.0.0.3",
+                effective_version="1.0.0.4",
+                changed_at=monitor.iso(monitor.now_utc()),
+            )
+            self.assertTrue(ok)
+        finally:
+            monitor.deliver_feishu_card = original_sender
+
+        body = sent["card"]["elements"][0]["content"]
+        self.assertIn("v1003 PublishedPublic -> v1004 PendingReview", body)
+        self.assertNotIn("PublishedPublic -> PendingReview", body)
+
 
 class EdgeMailMatchTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -408,6 +434,228 @@ class EdgeNotificationPolicyTests(unittest.TestCase):
         self.assertEqual(called["count"], 0)
         notif_count = conn.execute("SELECT COUNT(*) AS c FROM notifications WHERE task_id = ?", (task_id,)).fetchone()["c"]
         self.assertEqual(notif_count, 0)
+        conn.close()
+
+
+class ChromeDiscoveryTests(unittest.TestCase):
+    def test_ensure_chrome_watch_tasks_creates_task_for_new_submitted_version(self) -> None:
+        conn = monitor.db_connect(":memory:")
+        monitor.init_db(conn)
+        monitor.upsert_plugin(
+            conn,
+            store="chrome",
+            item_id="glcbkndciojfeepepdoeofgpojigcdmf",
+            product_id=None,
+            plugin_name="StreamFab Netflix Downloader for Browser",
+            detail_url=None,
+        )
+
+        original_fetch = monitor.fetch_chrome_item_snapshot
+        try:
+            monitor.fetch_chrome_item_snapshot = lambda _item_id: (
+                {
+                    "submitted_state": "PENDING_REVIEW",
+                    "submitted_version": "1004",
+                    "published_state": "PUBLISHED",
+                    "published_version": "1003",
+                    "status": "PendingReview",
+                    "reason": "chrome submitted state=PENDING_REVIEW; submitted_version=1004",
+                    "observed_version": "1004",
+                },
+                "chrome api ok",
+            )
+            monitor.ensure_chrome_watch_tasks(conn)
+        finally:
+            monitor.fetch_chrome_item_snapshot = original_fetch
+
+        row = conn.execute(
+            "SELECT store, item_id, version, status FROM tasks WHERE item_id = ? ORDER BY id DESC LIMIT 1",
+            ("glcbkndciojfeepepdoeofgpojigcdmf",),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["store"], "chrome")
+        self.assertEqual(monitor.canonical_version(row["version"]), "1004")
+        self.assertEqual(row["status"], "Monitoring")
+        conn.close()
+
+    def test_chrome_pending_review_sends_status_push(self) -> None:
+        conn = monitor.db_connect(":memory:")
+        monitor.init_db(conn)
+        task_id, _ = monitor.add_task(
+            conn,
+            store="chrome",
+            plugin_name="StreamFab Netflix Downloader for Browser",
+            detail_url=None,
+            item_id="glcbkndciojfeepepdoeofgpojigcdmf",
+            version="1004",
+            submitted_at=monitor.iso(monitor.now_utc()),
+            owner=None,
+            operation_id=None,
+            check_frequency_seconds=300,
+            timeout_hours=72,
+        )
+        row = conn.execute(
+            """
+            SELECT
+              id, store, item_id, product_id, version, submitted_at, status,
+              plugin_name, detail_url,
+              next_check_at, last_checked_at, check_frequency_seconds,
+              timeout_hours, timeout_started_at, owner, operation_id
+            FROM tasks
+            WHERE id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        task = monitor.Task(**dict(row))
+
+        original_fetch = monitor.fetch_task_status
+        original_notify = monitor.notify_feishu
+        called = {"count": 0}
+        try:
+            monitor.fetch_task_status = lambda _task: ("PendingReview", "chrome api pending", "chrome_api", "1004")
+
+            def fake_notify(*args, **kwargs):
+                called["count"] += 1
+                return True, "ok"
+
+            monitor.notify_feishu = fake_notify
+            monitor.handle_task(conn, task, webhook_url="", timeout_poll_seconds=7200, timeout_followup_days=7)
+        finally:
+            monitor.fetch_task_status = original_fetch
+            monitor.notify_feishu = original_notify
+
+        new_status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()["status"]
+        self.assertEqual(new_status, "PendingReview")
+        self.assertEqual(called["count"], 1)
+        notif_count = conn.execute("SELECT COUNT(*) AS c FROM notifications WHERE task_id = ?", (task_id,)).fetchone()["c"]
+        self.assertEqual(notif_count, 1)
+        conn.close()
+
+    def test_chrome_pending_review_is_held_when_publish_signal_is_too_early(self) -> None:
+        conn = monitor.db_connect(":memory:")
+        monitor.init_db(conn)
+        task_id, _ = monitor.add_task(
+            conn,
+            store="chrome",
+            plugin_name="StreamFab Netflix Downloader for Browser",
+            detail_url=None,
+            item_id="glcbkndciojfeepepdoeofgpojigcdmf",
+            version="1.0.0.4",
+            submitted_at=monitor.iso(monitor.now_utc() - monitor.dt.timedelta(minutes=10)),
+            owner=None,
+            operation_id=None,
+            check_frequency_seconds=300,
+            timeout_hours=72,
+        )
+        conn.execute("UPDATE tasks SET status = 'PendingReview' WHERE id = ?", (task_id,))
+        conn.commit()
+        row = conn.execute(
+            """
+            SELECT
+              id, store, item_id, product_id, version, submitted_at, status,
+              plugin_name, detail_url,
+              next_check_at, last_checked_at, check_frequency_seconds,
+              timeout_hours, timeout_started_at, owner, operation_id
+            FROM tasks
+            WHERE id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        task = monitor.Task(**dict(row))
+
+        original_fetch = monitor.fetch_task_status
+        original_notify = monitor.notify_feishu
+        called = {"count": 0}
+        try:
+            monitor.fetch_task_status = lambda _task: (
+                "PublishedPublic",
+                "chrome api chrome published state=PUBLISHED; published_version=1.0.0.4",
+                "chrome_api",
+                "1.0.0.4",
+            )
+
+            def fake_notify(*args, **kwargs):
+                called["count"] += 1
+                return True, "ok"
+
+            monitor.notify_feishu = fake_notify
+            monitor.handle_task(conn, task, webhook_url="", timeout_poll_seconds=7200, timeout_followup_days=7)
+        finally:
+            monitor.fetch_task_status = original_fetch
+            monitor.notify_feishu = original_notify
+
+        row2 = conn.execute(
+            "SELECT status, next_check_at FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        self.assertEqual(row2["status"], "PendingReview")
+        self.assertIsNotNone(row2["next_check_at"])
+        self.assertEqual(called["count"], 0)
+        conn.close()
+
+    def test_chrome_recent_pending_review_can_revert_from_publishedpublic(self) -> None:
+        conn = monitor.db_connect(":memory:")
+        monitor.init_db(conn)
+        task_id, _ = monitor.add_task(
+            conn,
+            store="chrome",
+            plugin_name="StreamFab Netflix Downloader for Browser",
+            detail_url=None,
+            item_id="glcbkndciojfeepepdoeofgpojigcdmf",
+            version="1.0.0.4",
+            submitted_at=monitor.iso(monitor.now_utc() - monitor.dt.timedelta(minutes=20)),
+            owner=None,
+            operation_id=None,
+            check_frequency_seconds=300,
+            timeout_hours=72,
+        )
+        conn.execute("UPDATE tasks SET status = 'PublishedPublic' WHERE id = ?", (task_id,))
+        conn.execute(
+            "INSERT INTO status_events(task_id, status, source, detail, event_time) VALUES (?, ?, ?, ?, ?)",
+            (task_id, "PendingReview", "chrome_api", "earlier pending", monitor.iso(monitor.now_utc() - monitor.dt.timedelta(minutes=5))),
+        )
+        conn.commit()
+        row = conn.execute(
+            """
+            SELECT
+              id, store, item_id, product_id, version, submitted_at, status,
+              plugin_name, detail_url,
+              next_check_at, last_checked_at, check_frequency_seconds,
+              timeout_hours, timeout_started_at, owner, operation_id
+            FROM tasks
+            WHERE id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        task = monitor.Task(**dict(row))
+
+        original_fetch = monitor.fetch_task_status
+        original_notify = monitor.notify_feishu
+        called = {"count": 0}
+        try:
+            monitor.fetch_task_status = lambda _task: (
+                "PublishedPublic",
+                "chrome api chrome published state=PUBLISHED; published_version=1.0.0.4",
+                "chrome_api",
+                "1.0.0.4",
+            )
+
+            def fake_notify(*args, **kwargs):
+                called["count"] += 1
+                return True, "ok"
+
+            monitor.notify_feishu = fake_notify
+            monitor.handle_task(conn, task, webhook_url="", timeout_poll_seconds=7200, timeout_followup_days=7)
+        finally:
+            monitor.fetch_task_status = original_fetch
+            monitor.notify_feishu = original_notify
+
+        row2 = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        self.assertEqual(row2["status"], "PendingReview")
+        self.assertEqual(called["count"], 0)
         conn.close()
 
 

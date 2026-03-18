@@ -74,6 +74,10 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def edge_api_base_url() -> str:
+    return os.getenv("EDGE_API_BASE_URL", "https://api.addons.microsoftedge.microsoft.com/v1").strip().rstrip("/")
+
+
 def default_plugin_name(item_id: str) -> Optional[str]:
     return PLUGIN_NAME_BY_ID.get((item_id or "").strip().lower())
 
@@ -367,12 +371,68 @@ def ensure_edge_watch_tasks(conn: sqlite3.Connection) -> None:
         )
 
 
+def ensure_chrome_watch_tasks(conn: sqlite3.Connection) -> None:
+    """Auto-discover newly submitted Chrome versions for registered plugins."""
+    plugins = conn.execute(
+        """
+        SELECT store, item_id, product_id, plugin_name, detail_url
+        FROM plugins
+        WHERE store = 'chrome' AND enabled = 1
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    now = iso(now_utc())
+    eligible_states = {"PENDING_REVIEW", "APPROVED", "PUBLISHED", "REJECTED", "DENIED", "CANCELLED", "CANCELED"}
+    for p in plugins:
+        snapshot, _detail = fetch_chrome_item_snapshot(str(p["item_id"]))
+        if not snapshot:
+            continue
+        submitted_state = str(snapshot.get("submitted_state") or "").upper()
+        submitted_version = str(snapshot.get("submitted_version") or "").strip()
+        if submitted_state not in eligible_states or not submitted_version:
+            continue
+        if find_task_by_version(conn, "chrome", str(p["item_id"]), submitted_version):
+            continue
+        add_task(
+            conn,
+            store="chrome",
+            plugin_name=str(p["plugin_name"] or "").strip() or None,
+            detail_url=str(p["detail_url"] or "").strip() or None,
+            item_id=str(p["item_id"]),
+            product_id=None,
+            version=submitted_version,
+            submitted_at=now,
+            owner=None,
+            operation_id=None,
+            check_frequency_seconds=env_int("DEFAULT_POLL_SECONDS", 300),
+            timeout_hours=env_int("TIMEOUT_HOURS", 72),
+            allow_duplicate=False,
+        )
+
+
 def find_active_task_by_version(conn: sqlite3.Connection, store: str, item_id: str, version: str) -> Optional[sqlite3.Row]:
     rows = conn.execute(
         """
         SELECT id, status, version
         FROM tasks
         WHERE store = ? AND item_id = ? AND status NOT IN ('Approved', 'Rejected', 'ActionRequired', 'Cancelled', 'TimeoutClosed')
+        ORDER BY id DESC
+        """,
+        (store, item_id),
+    ).fetchall()
+    target = canonical_version(version)
+    for r in rows:
+        if canonical_version(r["version"]) == target:
+            return r
+    return None
+
+
+def find_task_by_version(conn: sqlite3.Connection, store: str, item_id: str, version: str) -> Optional[sqlite3.Row]:
+    rows = conn.execute(
+        """
+        SELECT id, status, version
+        FROM tasks
+        WHERE store = ? AND item_id = ?
         ORDER BY id DESC
         """,
         (store, item_id),
@@ -557,14 +617,15 @@ def publish_edge_draft(product_id: str, notes: str) -> Tuple[str, str]:
     if not client_id or not api_key:
         raise RuntimeError("missing EDGE_CLIENT_ID or EDGE_API_KEY")
 
-    url = f"https://manage.devcenter.microsoft.com/v1.0/my/products/{product_id}/submissions"
+    url = f"{edge_api_base_url()}/products/{product_id}/submissions"
     headers = {
         "Authorization": f"ApiKey {api_key}",
         "X-ClientID": client_id,
-        "Content-Type": "application/json",
     }
-    payload = {"notes": notes or "Published current draft via API"}
-    resp = requests.post(url, headers=headers, json=payload, timeout=30)
+    # The Edge Add-ons Update API accepts a draft publish request with an empty
+    # body. Sending a JSON payload can lead to a failed operation with
+    # NoModulesUpdated even when a valid draft exists in Partner Center.
+    resp = requests.post(url, headers=headers, timeout=30)
     if resp.status_code >= 400:
         raise RuntimeError(f"edge publish http {resp.status_code}: {resp.text[:200]}")
     location = resp.headers.get("Location", "").strip()
@@ -572,6 +633,48 @@ def publish_edge_draft(product_id: str, notes: str) -> Tuple[str, str]:
     if not operation_id:
         raise RuntimeError("edge publish response missing Location/operation_id")
     return operation_id, location
+
+
+def upload_edge_package(product_id: str, package_path: str) -> Tuple[str, str]:
+    client_id = os.getenv("EDGE_CLIENT_ID", "").strip()
+    api_key = os.getenv("EDGE_API_KEY", "").strip()
+    if not client_id or not api_key:
+        raise RuntimeError("missing EDGE_CLIENT_ID or EDGE_API_KEY")
+
+    resolved = resolve_path(package_path)
+    if not os.path.exists(resolved):
+        raise RuntimeError(f"package file not found: {resolved}")
+
+    url = f"{edge_api_base_url()}/products/{product_id}/submissions/draft/package"
+    headers = {
+        "Authorization": f"ApiKey {api_key}",
+        "X-ClientID": client_id,
+        "Content-Type": "application/zip",
+    }
+    with open(resolved, "rb") as f:
+        resp = requests.post(url, headers=headers, data=f, timeout=120)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"edge package upload http {resp.status_code}: {resp.text[:200]}")
+    location = resp.headers.get("Location", "").strip()
+    operation_id = extract_operation_id_from_location(location)
+    if not operation_id:
+        raise RuntimeError("edge package upload response missing Location/operation_id")
+    return operation_id, location
+
+
+def fetch_edge_package_upload_status(product_id: str, operation_id: str) -> Tuple[str, str]:
+    client_id = os.getenv("EDGE_CLIENT_ID", "").strip()
+    api_key = os.getenv("EDGE_API_KEY", "").strip()
+    if not client_id or not api_key:
+        raise RuntimeError("missing EDGE_CLIENT_ID or EDGE_API_KEY")
+
+    url = f"{edge_api_base_url()}/products/{product_id}/submissions/draft/package/operations/{operation_id}"
+    headers = {"Authorization": f"ApiKey {api_key}", "X-ClientID": client_id}
+    resp = requests.get(url, headers=headers, timeout=30)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"edge package status http {resp.status_code}: {resp.text[:200]}")
+    body = resp.json()
+    return str(body.get("status", "")).strip(), json.dumps(body, ensure_ascii=False)
 
 
 def resolve_edge_product_id(conn: sqlite3.Connection, item_id: str, explicit_product_id: Optional[str]) -> str:
@@ -611,6 +714,27 @@ def should_send_status_notification(task: Task, status: str) -> bool:
     if task.store == "edge":
         return status in {"Approved", "Rejected", "ActionRequired"}
     return True
+
+
+def chrome_publish_confirmation_seconds() -> int:
+    # The Chrome fetchStatus API can transiently expose the new version only via
+    # publishedItemRevisionStatus while the dashboard still shows Pending review.
+    # Hold the task in PendingReview briefly to avoid a false "already published"
+    # transition from a single inconsistent response.
+    return max(0, env_int("CHROME_PUBLISH_CONFIRM_SECONDS", 7200))
+
+
+def task_recently_had_status(conn: sqlite3.Connection, task_id: int, status: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM status_events
+        WHERE task_id = ? AND status = ?
+        LIMIT 1
+        """,
+        (task_id, status),
+    ).fetchone()
+    return row is not None
 
 
 def record_notify(conn: sqlite3.Connection, task: Task, old_status: str, status: str, effective_version: str, channel: str) -> None:
@@ -673,6 +797,7 @@ def notify_feishu(
 ) -> Tuple[bool, str]:
     plugin_name = (task.plugin_name or "").strip() or default_plugin_name(task.item_id) or "未命名插件"
     detail_url = (task.detail_url or "").strip() or default_plugin_detail_url(task.item_id) or ""
+    changed_time = iso_utc8(parse_iso(changed_at))
     header_template = "blue"
     if new_status in {"Rejected", "MonitorFailed", "TimeoutClosed"}:
         header_template = "red"
@@ -703,13 +828,30 @@ def notify_feishu(
             return f"Timed follow-up monitoring ended for {name}"
         return f"Your product, {name}, is in review"
 
+    def plain_text(value: str) -> dict:
+        return {"tag": "plain_text", "content": value}
+
+    def version_label(value: str) -> str:
+        normalized = canonical_version(value)
+        return f"v{normalized or '-'}"
+
+    def extract_detail_version(detail_text: str, key: str) -> str:
+        m = re.search(rf"{re.escape(key)}=([0-9][0-9.]*)", detail_text or "")
+        return m.group(1) if m else ""
+
+    def chrome_status_update_text(old_s: str, new_s: str, version: str) -> str:
+        if old_s == "PublishedPublic" and new_s == "PendingReview":
+            previous_version = extract_detail_version(detail, "published_version")
+            return f"{version_label(previous_version)} PublishedPublic -> {version_label(version)} PendingReview"
+        return f"{old_s} -> {new_s}"
+
     actions = []
     if detail_url:
         actions.append(
             {
                 "tag": "button",
                 "type": "primary",
-                "text": {"tag": "plain_text", "content": "View Extension Detail"},
+                "text": plain_text("View Extension Detail"),
                 "url": detail_url,
             }
         )
@@ -718,34 +860,27 @@ def notify_feishu(
         card_title = "Edge Extension Audit Monitor"
         display_version = effective_version
         body = (
-            f"[Title]: {edge_title_text(new_status, plugin_name)}\n"
-            f"[ID]: {task.item_id}\n"
-            f"[Version]: {display_version}\n"
-            f"[Date(UTC+8)]: {iso_utc8(parse_iso(changed_at))}"
+            f"**Title**: {edge_title_text(new_status, plugin_name)}\n"
+            f"**ID**: {task.item_id}\n"
+            f"**Version**: {display_version}\n"
+            f"**Date(UTC+8)**: {changed_time}"
         )
     else:
         card_title = "Chrome Extension Audit Monitor"
         display_version = canonical_version(effective_version)
         body = (
-            "[Name]: {name}\n"
-            "[ID]: {item}\n"
-            "[Version]: {version}\n"
-            "[Status Update]: {old_s} -> {new_s}\n"
-            "[Date(UTC+8)]: {changed}"
-        ).format(
-            name=plugin_name,
-            item=task.item_id,
-            version=display_version,
-            old_s=old_status,
-            new_s=new_status,
-            changed=iso_utc8(parse_iso(changed_at)),
+            f"**Name**: {plugin_name}\n"
+            f"**ID**: {task.item_id}\n"
+            f"**Version**: {display_version}\n"
+            f"**Status Update**: {chrome_status_update_text(old_status, new_status, display_version)}\n"
+            f"**Date(UTC+8)**: {changed_time}"
         )
 
     card = {
         "config": {"wide_screen_mode": True},
         "header": {
             "template": header_template,
-            "title": {"tag": "plain_text", "content": card_title},
+            "title": plain_text(card_title),
         },
         "elements": [
             {
@@ -911,7 +1046,7 @@ def normalize_edge_operation_status(raw_json: dict) -> Tuple[str, str]:
     return "Monitoring", f"edge publish operation status={status or 'unknown'}"
 
 
-def normalize_chrome_status(raw_json: dict) -> Tuple[str, str, Optional[str]]:
+def parse_chrome_status_snapshot(raw_json: dict) -> dict:
     submitted = (raw_json.get("submittedItemRevisionStatus") or {}).get("state", "")
     published = (raw_json.get("publishedItemRevisionStatus") or {}).get("state", "")
     submitted_channels = (raw_json.get("submittedItemRevisionStatus") or {}).get("distributionChannels") or []
@@ -928,42 +1063,110 @@ def normalize_chrome_status(raw_json: dict) -> Tuple[str, str, Optional[str]]:
 
     # Priority: submitted revision reflects the newly uploaded version under review.
     if s == "PENDING_REVIEW":
-        return "PendingReview", (
-            f"chrome submitted state=PENDING_REVIEW; submitted_version={submitted_version or 'UNKNOWN'}; "
-            f"published state={p or 'UNKNOWN'}; published_version={published_version or 'UNKNOWN'}"
-        ), (submitted_version or published_version or None)
+        return {
+            "submitted_state": s,
+            "submitted_version": submitted_version,
+            "published_state": p,
+            "published_version": published_version,
+            "status": "PendingReview",
+            "reason": (
+                f"chrome submitted state=PENDING_REVIEW; submitted_version={submitted_version or 'UNKNOWN'}; "
+                f"published state={p or 'UNKNOWN'}; published_version={published_version or 'UNKNOWN'}"
+            ),
+            "observed_version": submitted_version or published_version or None,
+        }
     if s in {"REJECTED", "DENIED"}:
-        return "Rejected", f"chrome submitted state={s}; submitted_version={submitted_version or 'UNKNOWN'}", (submitted_version or None)
+        return {
+            "submitted_state": s,
+            "submitted_version": submitted_version,
+            "published_state": p,
+            "published_version": published_version,
+            "status": "Rejected",
+            "reason": f"chrome submitted state={s}; submitted_version={submitted_version or 'UNKNOWN'}",
+            "observed_version": submitted_version or None,
+        }
     if s in {"CANCELLED", "CANCELED"}:
-        return "Cancelled", f"chrome submitted state={s}; submitted_version={submitted_version or 'UNKNOWN'}", (submitted_version or None)
+        return {
+            "submitted_state": s,
+            "submitted_version": submitted_version,
+            "published_state": p,
+            "published_version": published_version,
+            "status": "Cancelled",
+            "reason": f"chrome submitted state={s}; submitted_version={submitted_version or 'UNKNOWN'}",
+            "observed_version": submitted_version or None,
+        }
     if s in {"PUBLISHED", "APPROVED"}:
-        return "Approved", f"chrome submitted state={s}; submitted_version={submitted_version or 'UNKNOWN'}", (submitted_version or None)
+        return {
+            "submitted_state": s,
+            "submitted_version": submitted_version,
+            "published_state": p,
+            "published_version": published_version,
+            "status": "Approved",
+            "reason": f"chrome submitted state={s}; submitted_version={submitted_version or 'UNKNOWN'}",
+            "observed_version": submitted_version or None,
+        }
 
     # Fallback to published revision when submitted revision is absent/unknown.
     if p == "PUBLISHED":
-        return "PublishedPublic", f"chrome published state=PUBLISHED; published_version={published_version or 'UNKNOWN'}", (published_version or None)
+        return {
+            "submitted_state": s,
+            "submitted_version": submitted_version,
+            "published_state": p,
+            "published_version": published_version,
+            "status": "PublishedPublic",
+            "reason": f"chrome published state=PUBLISHED; published_version={published_version or 'UNKNOWN'}",
+            "observed_version": published_version or None,
+        }
     if p in {"REJECTED", "DENIED"}:
-        return "Rejected", f"chrome published state={p}; published_version={published_version or 'UNKNOWN'}", (published_version or None)
-    return "Monitoring", "chrome state unresolved", None
+        return {
+            "submitted_state": s,
+            "submitted_version": submitted_version,
+            "published_state": p,
+            "published_version": published_version,
+            "status": "Rejected",
+            "reason": f"chrome published state={p}; published_version={published_version or 'UNKNOWN'}",
+            "observed_version": published_version or None,
+        }
+    return {
+        "submitted_state": s,
+        "submitted_version": submitted_version,
+        "published_state": p,
+        "published_version": published_version,
+        "status": "Monitoring",
+        "reason": "chrome state unresolved",
+        "observed_version": None,
+    }
 
 
-def fetch_chrome_status(task: Task) -> Tuple[str, str, Optional[str]]:
+def normalize_chrome_status(raw_json: dict) -> Tuple[str, str, Optional[str]]:
+    snapshot = parse_chrome_status_snapshot(raw_json)
+    return str(snapshot["status"]), str(snapshot["reason"]), snapshot["observed_version"]
+
+
+def fetch_chrome_item_snapshot(item_id: str) -> Tuple[Optional[dict], str]:
     publisher = os.getenv("CHROME_PUBLISHER_ID", "").strip()
     token = get_chrome_access_token()
     if not publisher or not token:
-        return "MonitorFailed", "missing CHROME_PUBLISHER_ID or access token config", None
+        return None, "missing CHROME_PUBLISHER_ID or access token config"
 
-    url = f"https://chromewebstore.googleapis.com/v2/publishers/{publisher}/items/{task.item_id}:fetchStatus"
+    url = f"https://chromewebstore.googleapis.com/v2/publishers/{publisher}/items/{item_id}:fetchStatus"
     headers = {"Authorization": f"Bearer {token}"}
     try:
         resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code >= 400:
-            return "MonitorFailed", f"chrome api http {resp.status_code}: {resp.text[:200]}", None
+            return None, f"chrome api http {resp.status_code}: {resp.text[:200]}"
         raw = resp.json()
-        status, reason, observed_version = normalize_chrome_status(raw)
-        return status, f"chrome api {reason}", observed_version
+        snapshot = parse_chrome_status_snapshot(raw)
+        return snapshot, f"chrome api {snapshot['reason']}"
     except Exception as e:
-        return "MonitorFailed", f"chrome api error: {e}", None
+        return None, f"chrome api error: {e}"
+
+
+def fetch_chrome_status(task: Task) -> Tuple[str, str, Optional[str]]:
+    snapshot, detail = fetch_chrome_item_snapshot(task.item_id)
+    if not snapshot:
+        return "MonitorFailed", detail, None
+    return str(snapshot["status"]), detail, snapshot["observed_version"]
 
 
 def fetch_edge_status_from_api(task: Task) -> Tuple[str, str]:
@@ -973,7 +1176,7 @@ def fetch_edge_status_from_api(task: Task) -> Tuple[str, str]:
     if not (client_id and api_key and task.operation_id and product_id):
         return "Monitoring", "edge api not configured or operation_id/product_id missing"
 
-    url = f"https://manage.devcenter.microsoft.com/v1.0/my/products/{product_id}/submissions/operations/{task.operation_id}"
+    url = f"{edge_api_base_url()}/products/{product_id}/submissions/operations/{task.operation_id}"
     headers = {"Authorization": f"ApiKey {api_key}", "X-ClientID": client_id}
     try:
         resp = requests.get(url, headers=headers, timeout=15)
@@ -1158,6 +1361,8 @@ def fetch_task_status(task: Task) -> Tuple[str, str, str, Optional[str]]:
         return s, d, "chrome_api", v
 
     api_status, api_detail = fetch_edge_status_from_api(task)
+    if task.operation_id and api_status == "Monitoring":
+        return api_status, api_detail, "edge_api", None
     if api_status in {"Approved", "Rejected", "ActionRequired", "MonitorFailed"}:
         return api_status, api_detail, "edge_api", None
 
@@ -1179,6 +1384,7 @@ def handle_task(
     old_status = task.status
     notify_old_status = old_status
     effective_version = task.version
+    suppress_status_push = False
 
     if task.timeout_started_at:
         timeout_begin = parse_iso(task.timeout_started_at)
@@ -1217,6 +1423,25 @@ def handle_task(
         # Review flow semantic: a newly submitted version transitions from public published to pending review.
         notify_old_status = "PublishedPublic"
 
+    if (
+        task.store == "chrome"
+        and new_status == "PublishedPublic"
+        and canonical_version(effective_version) == canonical_version(task.version)
+        and "published state=PUBLISHED" in detail
+    ):
+        confirm_seconds = chrome_publish_confirmation_seconds()
+        if confirm_seconds > 0:
+            elapsed_seconds = int((now - submitted).total_seconds())
+            if elapsed_seconds < confirm_seconds and (
+                old_status == "PendingReview" or task_recently_had_status(conn, task.id, "PendingReview")
+            ):
+                new_status = "PendingReview"
+                suppress_status_push = old_status == "PublishedPublic"
+                detail = (
+                    f"{detail}; holding PendingReview for confirmation "
+                    f"({elapsed_seconds}s<{confirm_seconds}s)"
+                )
+
     if new_status == "Monitoring":
         next_check = iso(now + dt.timedelta(seconds=task.check_frequency_seconds))
         if old_status != "Monitoring":
@@ -1248,6 +1473,7 @@ def handle_task(
         new_status != old_status
         and should_send_status_notification(task, new_status)
         and should_notify(conn, task, notify_old_status, new_status, effective_version)
+        and not suppress_status_push
     ):
         ok, note = notify_feishu(webhook_url, task, notify_old_status, new_status, detail, effective_version, changed_at)
         if ok:
@@ -1263,6 +1489,7 @@ def run_loop(conn: sqlite3.Connection, once: bool = False) -> None:
     edge_no_match_alert_repeat_hours = env_int("EDGE_NO_MATCH_ALERT_REPEAT_HOURS", 24)
 
     while True:
+        ensure_chrome_watch_tasks(conn)
         ensure_edge_watch_tasks(conn)
         tasks = due_tasks(conn)
         for t in tasks:
@@ -1334,6 +1561,7 @@ def main() -> None:
     publish.add_argument("--submitted-at", default=iso(now_utc()))
     publish.add_argument("--owner", default="")
     publish.add_argument("--notes", default="Published current draft via API")
+    publish.add_argument("--package-file", default="", help="Optional extension package zip to upload before publishing")
 
     run = sub.add_parser("run")
     run.add_argument("--once", action="store_true")
@@ -1428,6 +1656,10 @@ def main() -> None:
 
     if args.cmd == "publish-edge-draft":
         product_id = resolve_edge_product_id(conn, args.item_id, args.product_id or None)
+        package_operation_id = ""
+        package_location = ""
+        if args.package_file:
+            package_operation_id, package_location = upload_edge_package(product_id, args.package_file)
         operation_id, location = publish_edge_draft(product_id, args.notes)
         task_id, created = add_task(
             conn,
@@ -1448,7 +1680,9 @@ def main() -> None:
             update_task_edge_api_metadata(conn, task_id, product_id, operation_id, submitted_at=args.submitted_at)
         print(
             f"edge publish submitted: task_id={task_id} created={created} "
-            f"item_id={args.item_id} product_id={product_id} operation_id={operation_id} location={location}"
+            f"item_id={args.item_id} product_id={product_id} "
+            f"package_operation_id={package_operation_id} package_location={package_location} "
+            f"operation_id={operation_id} location={location}"
         )
         return
 

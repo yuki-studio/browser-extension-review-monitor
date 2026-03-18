@@ -11,14 +11,32 @@ if (!(Test-Path $cloudflared)) {
     throw "cloudflared not found at: $cloudflared"
 }
 
+function Get-PythonExe() {
+    $cmd = Get-Command python -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source -and (Test-Path $cmd.Source)) {
+        return $cmd.Source
+    }
+    foreach ($candidate in @(
+        "C:\Python314\python.exe",
+        "C:\Users\fab\AppData\Local\Programs\Python\Python312\python.exe"
+    )) {
+        if (Test-Path $candidate) {
+            return $candidate
+        }
+    }
+    throw "python executable not found"
+}
+
+$pythonExe = Get-PythonExe
+
 function Is-Running([string]$pattern) {
     $rows = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*$pattern*" }
     return ($rows -and $rows.Count -gt 0)
 }
 
 if (!(Is-Running "monitor.py run")) {
-    Start-Process -FilePath python `
-        -ArgumentList @("monitor.py", "run") `
+    Start-Process -FilePath $pythonExe `
+        -ArgumentList @("-u", "monitor.py", "run") `
         -WorkingDirectory $wd `
         -WindowStyle Hidden `
         -RedirectStandardOutput (Join-Path $logs "monitor.out.log") `
@@ -26,7 +44,7 @@ if (!(Is-Running "monitor.py run")) {
 }
 
 if (!(Is-Running "feishu_status_bot.py")) {
-    Start-Process -FilePath python `
+    Start-Process -FilePath $pythonExe `
         -ArgumentList @("-u", "feishu_status_bot.py") `
         -WorkingDirectory $wd `
         -WindowStyle Hidden `
