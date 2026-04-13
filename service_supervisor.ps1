@@ -1,5 +1,5 @@
 $ErrorActionPreference = "Continue"
-$wd = "C:\Users\fab\browser-review-monitor"
+$wd = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 while ($true) {
     try {

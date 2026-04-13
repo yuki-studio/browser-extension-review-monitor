@@ -17,13 +17,18 @@ import requests
 from dotenv import load_dotenv
 
 
-TERMINAL_STATUSES = {"Approved", "Rejected", "ActionRequired", "Cancelled", "TimeoutClosed"}
+# Chrome tasks should stop once a version is publicly published. New versions
+# are discovered via ensure_chrome_watch_tasks instead of continuing to poll the
+# already-published task forever.
+TERMINAL_STATUSES = {"Approved", "Rejected", "ActionRequired", "Cancelled", "TimeoutClosed", "PublishedPublic"}
 PLUGIN_NAME_BY_ID = {
     "pmblmkemjdeicgahfkiogdkhjhefhhea": "StreamFab Video Downloader for Browser",
     "glcbkndciojfeepepdoeofgpojigcdmf": "StreamFab Netflix Downloader for Browser",
 }
 PLUGIN_DETAIL_URL_BY_ID = {
     "pmblmkemjdeicgahfkiogdkhjhefhhea": "https://chromewebstore.google.com/detail/streamfab-video-downloade/pmblmkemjdeicgahfkiogdkhjhefhhea?authuser=0&hl=en",
+    "glcbkndciojfeepepdoeofgpojigcdmf": "https://chromewebstore.google.com/detail/streamfab-netflix-downloa/glcbkndciojfeepepdoeofgpojigcdmf?authuser=0&hl=en",
+    "gkniaichoipcgjpdcbbfekocjlhblegl": "https://chromewebstore.google.com/detail/streamfab-disney-plus-dow/gkniaichoipcgjpdcbbfekocjlhblegl?authuser=0&hl=en",
 }
 
 
@@ -86,12 +91,66 @@ def default_plugin_detail_url(item_id: str) -> Optional[str]:
     return PLUGIN_DETAIL_URL_BY_ID.get((item_id or "").strip().lower())
 
 
+def slugify_plugin_name(name: Optional[str]) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", (name or "").strip().lower())
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")
+    return slug or "extension"
+
+
+def infer_plugin_detail_url(
+    store: str,
+    item_id: str,
+    plugin_name: Optional[str] = None,
+    product_id: Optional[str] = None,
+) -> Optional[str]:
+    item = (item_id or "").strip().lower()
+    if not item:
+        return None
+
+    mapped_url = default_plugin_detail_url(item)
+    if mapped_url:
+        return mapped_url
+
+    name = (plugin_name or "").strip() or default_plugin_name(item) or "extension"
+    slug = slugify_plugin_name(name)
+    store_key = (store or "").strip().lower()
+
+    if store_key == "chrome":
+        return f"https://chromewebstore.google.com/detail/{slug}/{item}?authuser=0&hl=en"
+    if store_key == "edge":
+        return f"https://microsoftedge.microsoft.com/addons/detail/{slug}/{item}"
+    return None
+
+
 def canonical_version(v: Optional[str]) -> str:
     s = (v or "").strip()
     digits = re.sub(r"[^0-9]", "", s)
     if digits:
         return digits
     return s.lower()
+
+
+def is_terminal_status(status: Optional[str]) -> bool:
+    return (status or "").strip() in TERMINAL_STATUSES
+
+
+def terminal_status_params() -> tuple[str, ...]:
+    return tuple(sorted(TERMINAL_STATUSES))
+
+
+def terminal_status_placeholders() -> str:
+    return ", ".join("?" for _ in TERMINAL_STATUSES)
+
+
+def terminal_status_rank(status: Optional[str]) -> int:
+    return {
+        "PublishedPublic": 0,
+        "Approved": 1,
+        "Rejected": 2,
+        "ActionRequired": 3,
+        "Cancelled": 4,
+        "TimeoutClosed": 5,
+    }.get((status or "").strip(), 99)
 
 
 def resolve_path(path_value: str) -> str:
@@ -269,6 +328,7 @@ def upsert_plugin(
     detail_url: Optional[str],
 ) -> None:
     ts = iso(now_utc())
+    final_detail_url = (detail_url or "").strip() or infer_plugin_detail_url(store, item_id, plugin_name, product_id)
     conn.execute(
         """
         INSERT INTO plugins(store, item_id, product_id, plugin_name, detail_url, enabled, created_at, updated_at)
@@ -280,7 +340,7 @@ def upsert_plugin(
           enabled = 1,
           updated_at = excluded.updated_at
         """,
-        (store, item_id, product_id, plugin_name, detail_url, ts, ts),
+        (store, item_id, product_id, plugin_name, final_detail_url, ts, ts),
     )
     if store == "edge" and (product_id or "").strip():
         conn.execute(
@@ -323,15 +383,15 @@ def ensure_edge_watch_tasks(conn: sqlite3.Connection) -> None:
     now = iso(now_utc())
     for p in plugins:
         active = conn.execute(
-            """
+            f"""
             SELECT id
             FROM tasks
             WHERE store = 'edge' AND item_id = ?
-              AND status NOT IN ('Approved', 'Rejected', 'ActionRequired', 'Cancelled', 'TimeoutClosed')
+              AND status NOT IN ({terminal_status_placeholders()})
             ORDER BY id DESC
             LIMIT 1
             """,
-            (p["item_id"],),
+            (p["item_id"], *terminal_status_params()),
         ).fetchone()
         if active:
             continue
@@ -389,7 +449,19 @@ def ensure_chrome_watch_tasks(conn: sqlite3.Connection) -> None:
             continue
         submitted_state = str(snapshot.get("submitted_state") or "").upper()
         submitted_version = str(snapshot.get("submitted_version") or "").strip()
+        published_state = str(snapshot.get("published_state") or "").upper()
+        published_version = str(snapshot.get("published_version") or "").strip()
         if submitted_state not in eligible_states or not submitted_version:
+            continue
+        if (
+            published_state == "PUBLISHED"
+            and canonical_version(submitted_version)
+            and canonical_version(submitted_version) == canonical_version(published_version)
+        ):
+            # Auto-discovery should only open a task for a new review cycle. If
+            # Chrome already reports the same submitted version as publicly
+            # published, treating it as a fresh task can recreate an old
+            # release and emit a false late PublishedPublic notification.
             continue
         if find_task_by_version(conn, "chrome", str(p["item_id"]), submitted_version):
             continue
@@ -412,13 +484,13 @@ def ensure_chrome_watch_tasks(conn: sqlite3.Connection) -> None:
 
 def find_active_task_by_version(conn: sqlite3.Connection, store: str, item_id: str, version: str) -> Optional[sqlite3.Row]:
     rows = conn.execute(
-        """
+        f"""
         SELECT id, status, version
         FROM tasks
-        WHERE store = ? AND item_id = ? AND status NOT IN ('Approved', 'Rejected', 'ActionRequired', 'Cancelled', 'TimeoutClosed')
+        WHERE store = ? AND item_id = ? AND status NOT IN ({terminal_status_placeholders()})
         ORDER BY id DESC
         """,
-        (store, item_id),
+        (store, item_id, *terminal_status_params()),
     ).fetchall()
     target = canonical_version(version)
     for r in rows:
@@ -444,6 +516,23 @@ def find_task_by_version(conn: sqlite3.Connection, store: str, item_id: str, ver
     return None
 
 
+def find_terminal_task_by_version(conn: sqlite3.Connection, task: Task) -> Optional[sqlite3.Row]:
+    rows = conn.execute(
+        f"""
+        SELECT id, status, version
+        FROM tasks
+        WHERE store = ? AND item_id = ? AND id != ? AND status IN ({terminal_status_placeholders()})
+        ORDER BY id DESC
+        """,
+        (task.store, task.item_id, task.id, *terminal_status_params()),
+    ).fetchall()
+    target = canonical_version(task.version)
+    for r in rows:
+        if canonical_version(r["version"]) == target:
+            return r
+    return None
+
+
 def add_task(
     conn: sqlite3.Connection,
     store: str,
@@ -460,14 +549,18 @@ def add_task(
     product_id: Optional[str] = None,
 ) -> Tuple[int, bool]:
     if not allow_duplicate:
-        existing = find_active_task_by_version(conn, store, item_id, version)
+        existing = find_task_by_version(conn, store, item_id, version)
         if existing:
             return int(existing["id"]), False
 
     ts = now_utc()
     reg = get_registered_plugin(conn, store, item_id)
     final_plugin_name = (plugin_name or "").strip() or (reg["plugin_name"] if reg else None) or default_plugin_name(item_id)
-    final_detail_url = (detail_url or "").strip() or (reg["detail_url"] if reg else None) or default_plugin_detail_url(item_id)
+    final_detail_url = (
+        (detail_url or "").strip()
+        or (reg["detail_url"] if reg else None)
+        or infer_plugin_detail_url(store, item_id, final_plugin_name, product_id)
+    )
     final_product_id = (product_id or "").strip() or (reg["product_id"] if reg else None)
     conn.execute(
         """
@@ -505,7 +598,7 @@ def list_tasks(conn: sqlite3.Connection) -> None:
 
 def due_tasks(conn: sqlite3.Connection) -> list[Task]:
     rows = conn.execute(
-        """
+        f"""
         SELECT
           id, store, item_id, product_id, version, submitted_at, status,
           plugin_name, detail_url,
@@ -514,12 +607,92 @@ def due_tasks(conn: sqlite3.Connection) -> list[Task]:
         FROM tasks
         WHERE next_check_at IS NOT NULL
           AND next_check_at <= ?
-          AND status NOT IN ('Approved', 'Rejected', 'ActionRequired', 'Cancelled', 'TimeoutClosed')
+          AND status NOT IN ({terminal_status_placeholders()})
         ORDER BY next_check_at ASC
         """,
-        (iso(now_utc()),),
+        (iso(now_utc()), *terminal_status_params()),
     ).fetchall()
     return [Task(**dict(r)) for r in rows]
+
+
+def cleanup_duplicate_tasks(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT
+          id, store, item_id, product_id, version, submitted_at, status,
+          plugin_name, detail_url,
+          next_check_at, last_checked_at, check_frequency_seconds,
+          timeout_hours, timeout_started_at, owner, operation_id
+        FROM tasks
+        ORDER BY store ASC, item_id ASC, id DESC
+        """
+    ).fetchall()
+
+    groups: dict[tuple[str, str, str], list[Task]] = {}
+    for row in rows:
+        task = Task(**dict(row))
+        key = (task.store, task.item_id, canonical_version(task.version))
+        groups.setdefault(key, []).append(task)
+
+    for _key, tasks in groups.items():
+        terminal_tasks = [t for t in tasks if is_terminal_status(t.status)]
+        active_tasks = [t for t in tasks if not is_terminal_status(t.status)]
+
+        if terminal_tasks:
+            winner = sorted(terminal_tasks, key=lambda t: (terminal_status_rank(t.status), -t.id))[0]
+            cleanup_terminal_duplicate_group(conn, winner, tasks)
+            if not active_tasks:
+                continue
+
+            for task in active_tasks:
+                if task.id == winner.id:
+                    continue
+                detail = (
+                    f"duplicate task closed during cleanup: task {winner.id} already reached "
+                    f"{winner.status} for version {task.version}"
+                )
+                update_task_status(conn, task.id, winner.status, "cleanup", detail, None)
+            continue
+
+        keeper = active_tasks[0]
+        for task in active_tasks[1:]:
+            detail = (
+                f"duplicate active task closed during cleanup: task {keeper.id} is the authoritative "
+                f"active monitor for version {task.version}"
+            )
+            update_task_status(conn, task.id, "Cancelled", "cleanup", detail, None)
+
+
+def cleanup_terminal_duplicate_group(conn: sqlite3.Connection, winner: Task, tasks: list[Task]) -> None:
+    ts = iso(now_utc())
+    for task in tasks:
+        desired_status = winner.status
+        if (
+            task.status == desired_status
+            and task.next_check_at is None
+            and task.timeout_started_at is None
+        ):
+            continue
+        detail = (
+            f"cleanup normalized terminal duplicate to task {winner.id} status "
+            f"{winner.status} for version {task.version}"
+        )
+        conn.execute(
+            """
+            UPDATE tasks
+            SET status = ?, next_check_at = NULL, timeout_started_at = NULL, last_checked_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (desired_status, ts, ts, task.id),
+        )
+        conn.execute(
+            """
+            INSERT INTO status_events(task_id, status, source, detail, event_time)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (task.id, desired_status, "cleanup", detail, ts),
+        )
+    conn.commit()
 
 
 def update_task_status(conn: sqlite3.Connection, task_id: int, new_status: str, source: str,
@@ -737,6 +910,44 @@ def task_recently_had_status(conn: sqlite3.Connection, task_id: int, status: str
     return row is not None
 
 
+def maybe_backfill_chrome_published_notification(
+    conn: sqlite3.Connection,
+    webhook_url: str,
+    task: Task,
+    current_status: str,
+    detail: str,
+    effective_version: str,
+    changed_at: str,
+) -> bool:
+    if task.store != "chrome" or current_status != "PublishedPublic":
+        return False
+    if not task_recently_had_status(conn, task.id, "PendingReview"):
+        return False
+    if not should_send_status_notification(task, current_status):
+        return False
+    if not should_notify(conn, task, "PendingReview", current_status, effective_version):
+        return False
+    ok, _note = notify_feishu(webhook_url, task, "PendingReview", current_status, detail, effective_version, changed_at)
+    if ok:
+        record_notify(conn, task, "PendingReview", current_status, effective_version, "feishu")
+        return True
+    return False
+
+
+def normalize_notify_old_status(
+    conn: sqlite3.Connection,
+    task: Task,
+    old_status: str,
+    new_status: str,
+) -> str:
+    old_value = (old_status or "").strip()
+    if old_value != "TimeoutMonitoring" or new_status not in TERMINAL_STATUSES:
+        return old_value
+    if task.store == "chrome" and task_recently_had_status(conn, task.id, "PendingReview"):
+        return "PendingReview"
+    return "Monitoring"
+
+
 def record_notify(conn: sqlite3.Connection, task: Task, old_status: str, status: str, effective_version: str, channel: str) -> None:
     key = build_notify_key(task, old_status, status, effective_version)
     ts = iso(now_utc())
@@ -796,7 +1007,11 @@ def notify_feishu(
     changed_at: str,
 ) -> Tuple[bool, str]:
     plugin_name = (task.plugin_name or "").strip() or default_plugin_name(task.item_id) or "未命名插件"
-    detail_url = (task.detail_url or "").strip() or default_plugin_detail_url(task.item_id) or ""
+    detail_url = (
+        (task.detail_url or "").strip()
+        or infer_plugin_detail_url(task.store, task.item_id, plugin_name, task.product_id)
+        or ""
+    )
     changed_time = iso_utc8(parse_iso(changed_at))
     header_template = "blue"
     if new_status in {"Rejected", "MonitorFailed", "TimeoutClosed"}:
@@ -806,33 +1021,22 @@ def notify_feishu(
     elif new_status in {"Approved", "PublishedPublic"}:
         header_template = "green"
 
-    def edge_status_text(status: str) -> str:
+    def edge_status_update_text(status: str) -> str:
         return {
-            "Approved": "✅ 审核通过",
-            "Rejected": "❌ 审核拒绝",
-            "ActionRequired": "⚠️ 需要处理",
-        }.get(status, "⏳ 审核中")
-
-    def edge_title_text(status: str, name: str) -> str:
-        if status == "Approved":
-            return f"Your product, {name}, has been successfully published"
-        if status == "Rejected":
-            return f"Your product, {name}, was rejected"
-        if status == "ActionRequired":
-            return f"Your product, {name}, needs action"
-        if status == "MonitorFailed":
-            return f"Monitoring failed for {name}"
-        if status == "TimeoutMonitoring":
-            return f"Review is taking longer than expected for {name}"
-        if status == "TimeoutClosed":
-            return f"Timed follow-up monitoring ended for {name}"
-        return f"Your product, {name}, is in review"
+            "Approved": "Approved",
+            "Rejected": "Rejected",
+            "ActionRequired": "ActionRequired",
+            "MonitorFailed": "MonitorFailed",
+            "TimeoutMonitoring": "TimeoutMonitoring",
+            "TimeoutClosed": "TimeoutClosed",
+            "Monitoring": "Monitoring",
+        }.get((status or "").strip(), status)
 
     def plain_text(value: str) -> dict:
         return {"tag": "plain_text", "content": value}
 
     def version_label(value: str) -> str:
-        normalized = canonical_version(value)
+        normalized = (value or "").strip()
         return f"v{normalized or '-'}"
 
     def extract_detail_version(detail_text: str, key: str) -> str:
@@ -843,7 +1047,21 @@ def notify_feishu(
         if old_s == "PublishedPublic" and new_s == "PendingReview":
             previous_version = extract_detail_version(detail, "published_version")
             return f"{version_label(previous_version)} PublishedPublic -> {version_label(version)} PendingReview"
+        if old_s in {"Monitoring", "PendingReview"} and new_s in TERMINAL_STATUSES:
+            return new_s
         return f"{old_s} -> {new_s}"
+
+    def status_emoji(status_text: str) -> str:
+        normalized = (status_text or "").strip()
+        if any(token in normalized for token in ("Approved", "PublishedPublic")):
+            return "🟢"
+        if any(token in normalized for token in ("Rejected", "MonitorFailed", "TimeoutClosed")):
+            return "🔴"
+        if any(token in normalized for token in ("PendingReview", "TimeoutMonitoring", "ActionRequired")):
+            return "🟡"
+        if "No matched approval/rejection email" in normalized:
+            return "🟡"
+        return "🔵"
 
     actions = []
     if detail_url:
@@ -858,22 +1076,25 @@ def notify_feishu(
 
     if task.store == "edge":
         card_title = "Edge Extension Audit Monitor"
-        display_version = effective_version
+        display_version = (effective_version or "").strip() or task.version
+        edge_status_text = edge_status_update_text(new_status)
         body = (
-            f"**Title**: {edge_title_text(new_status, plugin_name)}\n"
-            f"**ID**: {task.item_id}\n"
+            f"**Name**: {plugin_name}\n"
+            f"**Status Update**: {status_emoji(edge_status_text)} {edge_status_text}\n"
             f"**Version**: {display_version}\n"
-            f"**Date(UTC+8)**: {changed_time}"
+            f"**Date(UTC+8)**: {changed_time}\n"
+            f"**ID**: {task.item_id}"
         )
     else:
         card_title = "Chrome Extension Audit Monitor"
-        display_version = canonical_version(effective_version)
+        display_version = (effective_version or "").strip() or task.version
+        chrome_status_text = chrome_status_update_text(old_status, new_status, display_version)
         body = (
             f"**Name**: {plugin_name}\n"
-            f"**ID**: {task.item_id}\n"
+            f"**Status Update**: {status_emoji(chrome_status_text)} {chrome_status_text}\n"
             f"**Version**: {display_version}\n"
-            f"**Status Update**: {chrome_status_update_text(old_status, new_status, display_version)}\n"
-            f"**Date(UTC+8)**: {changed_time}"
+            f"**Date(UTC+8)**: {changed_time}\n"
+            f"**ID**: {task.item_id}"
         )
 
     card = {
@@ -948,7 +1169,11 @@ def maybe_send_edge_no_match_alert(
         return
 
     plugin_name = (task.plugin_name or "").strip() or default_plugin_name(task.item_id) or "未命名插件"
-    detail_url = (task.detail_url or "").strip() or default_plugin_detail_url(task.item_id) or ""
+    detail_url = (
+        (task.detail_url or "").strip()
+        or infer_plugin_detail_url(task.store, task.item_id, plugin_name, task.product_id)
+        or ""
+    )
     elapsed_hours = max(1, elapsed_seconds // 3600)
     actions = []
     if detail_url:
@@ -970,13 +1195,13 @@ def maybe_send_edge_no_match_alert(
             {
                 "tag": "markdown",
                 "content": (
-                    f"[Alert]: No matched approval/rejection email for {elapsed_hours}h\n"
-                    f"[Name]: {plugin_name}\n"
-                    f"[ID]: {task.item_id}\n"
-                    f"[Version]: {task.version}\n"
-                    f"[Submitted(UTC+8)]: {iso_utc8(submitted)}\n"
-                    f"[Checked(UTC+8)]: {iso_utc8(now)}\n"
-                    f"[Detail]: {detail}"
+                    f"**Name**: {plugin_name}\n"
+                    f"**Status Update**: 🟡 No matched approval/rejection email for {elapsed_hours}h\n"
+                    f"**Version**: {task.version}\n"
+                    f"**Submitted(UTC+8)**: {iso_utc8(submitted)}\n"
+                    f"**Checked(UTC+8)**: {iso_utc8(now)}\n"
+                    f"**ID**: {task.item_id}\n"
+                    f"**Detail**: {detail}"
                 ),
             },
             {"tag": "action", "actions": actions} if actions else {"tag": "hr"},
@@ -1385,6 +1610,14 @@ def handle_task(
     notify_old_status = old_status
     effective_version = task.version
     suppress_status_push = False
+    duplicate_terminal = find_terminal_task_by_version(conn, task)
+    if duplicate_terminal:
+        detail = (
+            f"duplicate task closed: task {duplicate_terminal['id']} already reached "
+            f"{duplicate_terminal['status']} for version {task.version}"
+        )
+        update_task_status(conn, task.id, str(duplicate_terminal["status"]), "dedup", detail, None)
+        return
 
     if task.timeout_started_at:
         timeout_begin = parse_iso(task.timeout_started_at)
@@ -1463,7 +1696,7 @@ def handle_task(
     if new_status == "MonitorFailed":
         next_check = iso(now + dt.timedelta(seconds=task.check_frequency_seconds))
         changed_at = update_task_status(conn, task.id, new_status, source, detail, next_check)
-    elif new_status in TERMINAL_STATUSES:
+    elif is_terminal_status(new_status):
         changed_at = update_task_status(conn, task.id, new_status, source, detail, None)
     else:
         next_check = iso(now + dt.timedelta(seconds=task.check_frequency_seconds))
@@ -1472,12 +1705,37 @@ def handle_task(
     if (
         new_status != old_status
         and should_send_status_notification(task, new_status)
-        and should_notify(conn, task, notify_old_status, new_status, effective_version)
+        and should_notify(
+            conn,
+            task,
+            normalize_notify_old_status(conn, task, notify_old_status, new_status),
+            new_status,
+            effective_version,
+        )
         and not suppress_status_push
     ):
-        ok, note = notify_feishu(webhook_url, task, notify_old_status, new_status, detail, effective_version, changed_at)
+        final_notify_old_status = normalize_notify_old_status(conn, task, notify_old_status, new_status)
+        ok, note = notify_feishu(
+            webhook_url,
+            task,
+            final_notify_old_status,
+            new_status,
+            detail,
+            effective_version,
+            changed_at,
+        )
         if ok:
-            record_notify(conn, task, notify_old_status, new_status, effective_version, "feishu")
+            record_notify(conn, task, final_notify_old_status, new_status, effective_version, "feishu")
+    elif old_status == new_status:
+        maybe_backfill_chrome_published_notification(
+            conn,
+            webhook_url,
+            task,
+            new_status,
+            detail,
+            effective_version,
+            changed_at,
+        )
 
 
 def run_loop(conn: sqlite3.Connection, once: bool = False) -> None:
@@ -1491,6 +1749,7 @@ def run_loop(conn: sqlite3.Connection, once: bool = False) -> None:
     while True:
         ensure_chrome_watch_tasks(conn)
         ensure_edge_watch_tasks(conn)
+        cleanup_duplicate_tasks(conn)
         tasks = due_tasks(conn)
         for t in tasks:
             handle_task(

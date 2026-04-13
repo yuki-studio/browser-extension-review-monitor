@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$wd = "C:\Users\fab\browser-review-monitor"
+$wd = Split-Path -Parent $MyInvocation.MyCommand.Path
 $logs = Join-Path $wd "logs"
 if (!(Test-Path $logs)) {
     New-Item -ItemType Directory -Path $logs | Out-Null

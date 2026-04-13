@@ -78,6 +78,31 @@ class TaskDedupTests(unittest.TestCase):
         self.assertNotEqual(task_id1, task_id2)
         self.assertEqual(count, 2)
 
+    def test_due_tasks_excludes_publishedpublic(self) -> None:
+        task_id, created = monitor.add_task(
+            self.conn,
+            store="chrome",
+            plugin_name=None,
+            detail_url=None,
+            item_id="abc",
+            version="1.0.0.9",
+            submitted_at=monitor.iso(monitor.now_utc()),
+            owner=None,
+            operation_id=None,
+            check_frequency_seconds=300,
+            timeout_hours=72,
+        )
+        self.assertTrue(created)
+        self.conn.execute(
+            "UPDATE tasks SET status = 'PublishedPublic', next_check_at = ? WHERE id = ?",
+            (monitor.iso(monitor.now_utc() - monitor.dt.timedelta(minutes=1)), task_id),
+        )
+        self.conn.commit()
+
+        tasks = monitor.due_tasks(self.conn)
+
+        self.assertEqual(tasks, [])
+
 
 if __name__ == "__main__":
     unittest.main()

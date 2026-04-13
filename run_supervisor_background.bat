@@ -1,3 +1,4 @@
 @echo off
-cd /d C:\Users\fab\browser-review-monitor
-start "" powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\Users\fab\browser-review-monitor\service_supervisor.ps1"
+set "WD=%~dp0"
+cd /d "%WD%"
+start "" powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File "%WD%service_supervisor.ps1"

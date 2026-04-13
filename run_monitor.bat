@@ -1,3 +1,4 @@
 @echo off
-cd /d "C:\Users\fab\browser-review-monitor"
-python monitor.py run 1>> "C:\Users\fab\browser-review-monitor\logs\monitor.out.log" 2>> "C:\Users\fab\browser-review-monitor\logs\monitor.err.log"
+set "WD=%~dp0"
+cd /d "%WD%"
+python monitor.py run 1>> "%WD%logs\monitor.out.log" 2>> "%WD%logs\monitor.err.log"

@@ -1,10 +1,10 @@
-$wd = "C:\Users\fab\browser-review-monitor"
+$wd = Split-Path -Parent $MyInvocation.MyCommand.Path
 $logs = Join-Path $wd "logs"
 
 Write-Output "=== Process Check ==="
 try {
     Get-CimInstance Win32_Process |
-        Where-Object { $_.Name -match "python|cloudflared" -and ($_.CommandLine -like "*browser-review-monitor*" -or $_.Name -eq "cloudflared.exe") } |
+        Where-Object { $_.Name -match "python|cloudflared" -and ($_.CommandLine -like "*$wd*" -or $_.Name -eq "cloudflared.exe") } |
         Select-Object ProcessId, Name, CommandLine
 } catch {
     Write-Output "Get-CimInstance unavailable; skipped detailed process check."
