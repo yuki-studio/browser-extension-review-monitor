@@ -1014,7 +1014,7 @@ def notify_feishu(
     )
     changed_time = iso_utc8(parse_iso(changed_at))
     header_template = "blue"
-    if new_status in {"Rejected", "MonitorFailed", "TimeoutClosed"}:
+    if new_status in {"Rejected", "MonitorFailed", "TimeoutClosed", "Cancelled"}:
         header_template = "red"
     elif new_status in {"PendingReview", "TimeoutMonitoring", "ActionRequired"}:
         header_template = "orange"
@@ -1053,9 +1053,11 @@ def notify_feishu(
 
     def status_emoji(status_text: str) -> str:
         normalized = (status_text or "").strip()
+        if "->" in normalized:
+            normalized = normalized.split("->")[-1].strip()
         if any(token in normalized for token in ("Approved", "PublishedPublic")):
             return "🟢"
-        if any(token in normalized for token in ("Rejected", "MonitorFailed", "TimeoutClosed")):
+        if any(token in normalized for token in ("Rejected", "MonitorFailed", "TimeoutClosed", "Cancelled")):
             return "🔴"
         if any(token in normalized for token in ("PendingReview", "TimeoutMonitoring", "ActionRequired")):
             return "🟡"
