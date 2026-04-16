@@ -442,7 +442,7 @@ class EdgeMailMatchTests(unittest.TestCase):
         self.assertIsNone(rows[1]["timeout_started_at"])
         conn.close()
 
-    def test_edge_no_match_alert_is_bucket_deduped(self) -> None:
+    def test_edge_no_match_alert_repeats_only_after_full_interval(self) -> None:
         conn = monitor.db_connect(":memory:")
         monitor.init_db(conn)
         old_sender = monitor.deliver_feishu_card
@@ -495,6 +495,16 @@ class EdgeMailMatchTests(unittest.TestCase):
                 repeat_hours=24,
             )
             self.assertEqual(sent["count"], 1)
+            monitor.maybe_send_edge_no_match_alert(
+                conn,
+                webhook_url="",
+                task=task,
+                now=now + monitor.dt.timedelta(hours=24, minutes=1),
+                detail="edge email: no matching result yet",
+                alert_hours=24,
+                repeat_hours=24,
+            )
+            self.assertEqual(sent["count"], 2)
         finally:
             monitor.deliver_feishu_card = old_sender
             conn.close()

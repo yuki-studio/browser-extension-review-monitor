@@ -1138,8 +1138,29 @@ def parse_edge_mail_name_aliases() -> dict[str, list[str]]:
     return result
 
 
-def build_edge_no_match_alert_key(task: Task, bucket: int) -> str:
-    return f"edge_no_match|{task.item_id}|{canonical_version(task.version)}|{bucket}"
+def build_edge_no_match_alert_prefix(task: Task) -> str:
+    return f"edge_no_match|{task.item_id}|{canonical_version(task.version)}"
+
+
+def build_edge_no_match_alert_key(task: Task, now: dt.datetime) -> str:
+    return f"{build_edge_no_match_alert_prefix(task)}|{int(now.timestamp())}"
+
+
+def latest_edge_no_match_alert_sent_at(conn: sqlite3.Connection, task: Task) -> Optional[dt.datetime]:
+    prefix = build_edge_no_match_alert_prefix(task)
+    row = conn.execute(
+        """
+        SELECT sent_at
+        FROM notification_keys
+        WHERE k LIKE ?
+        ORDER BY sent_at DESC
+        LIMIT 1
+        """,
+        (f"{prefix}|%",),
+    ).fetchone()
+    if not row or not row["sent_at"]:
+        return None
+    return parse_iso(str(row["sent_at"]))
 
 
 def maybe_send_edge_no_match_alert(
@@ -1164,10 +1185,8 @@ def maybe_send_edge_no_match_alert(
         return
 
     interval_seconds = max(3600, max(1, repeat_hours) * 3600)
-    bucket = int(now.timestamp()) // interval_seconds
-    key = build_edge_no_match_alert_key(task, bucket)
-    exists = conn.execute("SELECT 1 FROM notification_keys WHERE k = ?", (key,)).fetchone()
-    if exists:
+    last_sent_at = latest_edge_no_match_alert_sent_at(conn, task)
+    if last_sent_at and (now - last_sent_at).total_seconds() < interval_seconds:
         return
 
     plugin_name = (task.plugin_name or "").strip() or default_plugin_name(task.item_id) or "未命名插件"
@@ -1211,6 +1230,7 @@ def maybe_send_edge_no_match_alert(
     }
     ok, _ = deliver_feishu_card(webhook_url, card)
     if ok:
+        key = build_edge_no_match_alert_key(task, now)
         record_notification_key(conn, key)
 
 
@@ -1958,4 +1978,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
